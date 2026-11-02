@@ -148,8 +148,17 @@ export async function normalizeIngestBatch(rawEvents, rawBatchId) {
 
 /**
  * 代调 SAG `POST /ingest`。
- * 返回 { ok, accepted, reason, status }；失败不抛异常（端上据此把整批留在 outbox 里补发）。
- * accepted 取 SAG 回包里的 accepted（认不出就按本批条数算）。
+ * 返回 { ok, accepted, reason, status, failedAt }；失败不抛异常（端上据此把整批留在 outbox 里补发）。
+ *
+ * 2026-11-02 修正：SAG /ingest 是单条契约（{sourceId?, title, content, metadata?, extract?…}），
+ * 不认 {batch_id, events} 批量体（zod 直接 400）。本函数改为逐条循环转发：
+ * - 每条 event 按 SAG 单条 schema 组装：title=[Chat]采集·<type>，content=原文，
+ *   metadata={owner 溯源（Chat 端会话鉴权已由路由层完成），client_msg_id=event_id（幂等出生 ID，
+ *   SAG 幂等闸按它去重——重发安全），ts}。
+ * - 逐条结果累计：全部成功才 ok:true（accepted=条数）；中途失败记 failedAt（端上拆批续传的起点）。
+ * - 每条独立超时（SAG 入库含 LLM 抽取，帮帮端实测量级是 60s——worker 侧 8s/15s 会误杀长提取。
+ *   这里保留单条 8s 默认、可放宽 15s 的原口径：SAG 的 Laya 门卫+抽取在直写流上被 extract 跳过，
+ *   采集事件带 extract:false 走直写路径，不跑 LLM，8s 够）。
  */
 export async function postIngest(env, token, events, { batchId = "", fetchImpl = fetch, timeoutMs = INGEST_TIMEOUT_MS } = {}) {
   const list = Array.isArray(events) ? events : [];
@@ -157,39 +166,64 @@ export async function postIngest(env, token, events, { batchId = "", fetchImpl =
   if (!list.length) return { ok: true, accepted: 0, reason: "", status: 0 };
 
   const wait = Math.min(Math.max(Number(timeoutMs) || INGEST_TIMEOUT_MS, 1000), INGEST_TIMEOUT_MAX_MS);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), wait);
-  try {
-    const response = await fetchImpl(ingestUrl(env), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-SAG-Token": token },
-      body: JSON.stringify({ batch_id: batchId, events: list }),
-      signal: controller.signal
-    });
-    const text = await response.text();
-    let payload = null;
+  let accepted = 0;
+  for (let index = 0; index < list.length; index += 1) {
+    const event = list[index];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), wait);
     try {
-      payload = text ? JSON.parse(text) : null;
-    } catch {
-      payload = null;
+      const body = {
+        title: `[Chat] 采集·${event.type}`,
+        content: String(event.content || ""),
+        metadata: {
+          source: "chat",
+          type: event.type,
+          ts: event.ts,
+          client_msg_id: event.event_id || "",
+          ...(event.meta && typeof event.meta === "object" ? event.meta : {})
+        },
+        // 采集事件是原文直写（帮帮口径：不做总结、不进知识图谱）——跳过 LLM 抽取与 Laya 门卫
+        extract: false
+      };
+      const response = await fetchImpl(ingestUrl(env), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SAG-Token": token },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      const text = await response.text();
+      let payload = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        payload = null;
+      }
+      if (!response.ok) {
+        // 4xx（令牌/越权/格式）重发无意义；5xx/超时端上补发。SAG 幂等闸保证已写入的条目重发不重复。
+        return {
+          ok: false,
+          accepted,
+          reason: `http_${response.status}`,
+          status: response.status,
+          failedAt: index
+        };
+      }
+      if (payload !== null && typeof payload !== "object") {
+        return { ok: false, accepted, reason: "bad_payload", status: response.status, failedAt: index };
+      }
+      accepted += 1;
+    } catch (error) {
+      const name = String(error?.name || "");
+      return {
+        ok: false,
+        accepted,
+        reason: name === "AbortError" ? "timeout" : `network: ${safeDetail(error?.message || error)}`,
+        status: 0,
+        failedAt: index
+      };
+    } finally {
+      clearTimeout(timer);
     }
-    if (!response.ok) {
-      return { ok: false, accepted: 0, reason: `http_${response.status}`, status: response.status };
-    }
-    if (payload !== null && typeof payload !== "object") {
-      return { ok: false, accepted: 0, reason: "bad_payload", status: response.status };
-    }
-    const accepted = Number.isFinite(Number(payload?.accepted)) ? Number(payload.accepted) : list.length;
-    return { ok: true, accepted, reason: "", status: response.status };
-  } catch (error) {
-    const name = String(error?.name || "");
-    return {
-      ok: false,
-      accepted: 0,
-      reason: name === "AbortError" ? "timeout" : `network: ${safeDetail(error?.message || error)}`,
-      status: 0
-    };
-  } finally {
-    clearTimeout(timer);
   }
+  return { ok: true, accepted, reason: "", status: 200 };
 }

@@ -115,20 +115,31 @@ test("路由级：成功代报——URL/请求头/请求体/响应体口径", as
   assert.match(body.batchId, /^[0-9a-f]{32}$/);
   assert.equal(JSON.stringify(body).includes("sagk_test_token_ingest"), false);
 
-  assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /\/pi\/ingest$/);
-  assert.equal(calls[0].init.method, "POST");
-  assert.equal(calls[0].init.headers["X-SAG-Token"], "sagk_test_token_ingest");
-  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
-  assert.match(calls[0].body.batch_id, /^[0-9a-f]{32}$/);
-  assert.equal(calls[0].body.events.length, 2);
-  assert.match(calls[0].body.events[0].event_id, /^[0-9a-f]{32}$/);
-  assert.equal(calls[0].body.events[0].type, "notification");
-  assert.equal(calls[0].body.events[0].content, "工资到账 0");
-  assert.equal(calls[0].body.events[0].ts, 1761888000000);
-  assert.equal(calls[0].body.events[0].meta.package, "com.demo.app");
+  // 2026-11-02 逐条转发修正：SAG /ingest 是单条契约，2 条事件 = 2 次独立 POST
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.match(call.url, /\/pi\/ingest$/);
+    assert.equal(call.init.method, "POST");
+    assert.equal(call.init.headers["X-SAG-Token"], "sagk_test_token_ingest");
+    assert.equal(call.init.headers["Content-Type"], "application/json");
+    // 单条 SAG 文档：title/content/metadata/extract——不再有 batch_id/events 数组
+    assert.equal(typeof call.body.title, "string");
+    assert.ok(call.body.title.length > 0);
+    assert.equal(typeof call.body.content, "string");
+    assert.equal(call.body.extract, false);
+    assert.equal(Array.isArray(call.body.events), false);
+    assert.equal("batch_id" in call.body, false);
+  }
+  // 幂等出生 ID 落在 metadata.client_msg_id（SAG 幂等闸按它去重）
+  assert.match(calls[0].body.metadata.client_msg_id, /^[0-9a-f]{32}$/);
+  assert.match(calls[1].body.metadata.client_msg_id, /^[0-9a-f]{32}$/);
+  assert.notEqual(calls[0].body.metadata.client_msg_id, calls[1].body.metadata.client_msg_id);
+  assert.equal(calls[0].body.metadata.type, "notification");
+  assert.equal(calls[0].body.content, "工资到账 0");
+  assert.equal(calls[0].body.metadata.ts, 1761888000000);
+  assert.equal(calls[0].body.metadata.package, "com.demo.app");
   // 这条链路只收文字：请求体里不出现任何音频字段
-  assert.equal(JSON.stringify(calls[0].body).includes("audio"), false);
+  assert.equal(JSON.stringify(calls.map((c) => c.body)).includes("audio"), false);
 });
 
 test("幂等：同一批离线补发两次 → batch_id/event_id 完全一致（不重）；内容变了才换键", async (t) => {
@@ -154,17 +165,21 @@ test("幂等：同一批离线补发两次 → batch_id/event_id 完全一致（
     type: event.type
   }));
   await callIngest(env, session.token, { events: replay });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].body.batch_id, calls[0].body.batch_id);
+  // 2 条/批 × 2 次 = 4 次单条 POST；重发批的 client_msg_id 与首批一一对应
+  assert.equal(calls.length, 4);
   assert.deepEqual(
-    calls[1].body.events.map((event) => event.event_id),
-    calls[0].body.events.map((event) => event.event_id)
+    calls[2].body.metadata.client_msg_id,
+    calls[0].body.metadata.client_msg_id
+  );
+  assert.deepEqual(
+    calls[3].body.metadata.client_msg_id,
+    calls[1].body.metadata.client_msg_id
   );
 
   const changed = sampleEvents(2);
   changed[0].content = "工资到账 0（改过）";
   await callIngest(env, session.token, { events: changed });
-  assert.notEqual(calls[2].body.events[0].event_id, calls[0].body.events[0].event_id);
+  assert.notEqual(calls[4].body.metadata.client_msg_id, calls[0].body.metadata.client_msg_id);
 });
 
 test("批内重复：同一条事件塞两次 → 只发一条、skipped 记 1（不重）", async (t) => {
@@ -187,8 +202,9 @@ test("批内重复：同一条事件塞两次 → 只发一条、skipped 记 1�
   assert.equal(body.ok, true);
   assert.equal(body.accepted, 1);
   assert.equal(body.skipped, 1);
+  // 批内重复在归一化层去重：只向 SAG 发 1 次单条 POST
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].body.events.length, 1);
+  assert.equal(calls[0].body.metadata.client_msg_id, calls[0].body.metadata.client_msg_id);
 });
 
 test("端上自带 eventId/batchId → 原样透传（不重算）", async (t) => {
@@ -210,8 +226,8 @@ test("端上自带 eventId/batchId → 原样透传（不重算）", async (t) =
   });
   assert.equal(res.status, 200);
   assert.equal((await res.json()).batchId, "batch-20261031-0001");
-  assert.equal(calls[0].body.batch_id, "batch-20261031-0001");
-  assert.equal(calls[0].body.events[0].event_id, "evt-0001");
+  // 端上出生 eventId 原样透传到 SAG 单条的 metadata.client_msg_id
+  assert.equal(calls[0].body.metadata.client_msg_id, "evt-0001");
 });
 
 test("400 口径：超 50 条 / 非文字 content / 非法 type / 缺 ts / 非法 eventId 一律不落上游", async (t) => {
@@ -281,6 +297,7 @@ test("SAG 失败 → 502 {ok:false,reason}（端上据非 2xx 补发）；无台
   const failedBody = await failed.json();
   assert.equal(failedBody.ok, false);
   assert.equal(failedBody.reason, "http_503");
+  assert.equal(failedBody.failedAt, 0);
   assert.equal(JSON.stringify(failedBody).includes("sagk_t6_secret"), false);
 
   // 未开户的普通用户：不落库、不报错、也不放行

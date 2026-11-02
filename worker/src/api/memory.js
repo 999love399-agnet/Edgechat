@@ -275,8 +275,10 @@ export function registerMemoryRoutes(app) {
 
     const result = await postIngest(c.env, token.token, batch.events, { batchId: batch.batchId });
     if (!result.ok) {
-      // SAG 失败一律 502，端上据非 2xx 攒批重试；令牌/正文都不回传
-      return c.json({ ok: false, reason: result.reason }, 502);
+      // SAG 失败一律 502，端上据非 2xx 攒批重试；令牌/正文都不回传。
+      // failedAt（2026-11-02 逐条转发修正）：本批第 N 条失败——端上可按它把余量拆批续传
+      // （已成功条目有 SAG 幂等闸 client_msg_id=event_id 兜底，重发不会重复落库）。
+      return c.json({ ok: false, reason: result.reason, failedAt: result.failedAt ?? 0 }, 502);
     }
 
     return c.json({ ok: true, accepted: result.accepted, skipped: batch.skipped, batchId: batch.batchId }, 200);
