@@ -173,7 +173,13 @@ test("文本会话结算：幂等、无台账降级、202 记录", async () => {
   // 开户后 → reported
   await saveMemoryAccount(env, user.id, { customerId: "CUST-T0042", token: "sagk_t", deviceId: memoryDeviceId(user.id) });
   let piCalls = 0;
-  const piFetch = async () => {
+  let speakCalls = 0;
+  const piFetch = async (url = "") => {
+    // 说话直写（帮帮移植）与 pi 摘要是两条 URL：/ingest 与 /pi/api/session/ended
+    if (String(url).includes("/ingest")) {
+      speakCalls += 1;
+      return { status: 200, text: async () => JSON.stringify({ ok: true }) };
+    }
     piCalls += 1;
     return { status: 202, text: async () => JSON.stringify({ ok: true }) };
   };
@@ -185,6 +191,8 @@ test("文本会话结算：幂等、无台账降级、202 记录", async () => {
   });
   assert.equal(first.status, "reported");
   assert.equal(first.piStatus, 202);
+  // 说话直写已随结算转发（用户发的"在吗"进记忆库）
+  assert.equal(speakCalls, 1);
 
   // 同 room+lastMessageId 再结算 → duplicate，且不再调 /pi
   const second = await settleTextSession(env, {
@@ -207,7 +215,11 @@ test("T7：pi 非 2xx 不永久丢摘要——cron 重试成功", async () => {
   const message = await insertMessage(env, { channelId: dm.id, senderId: user.id, content: "在吗" });
 
   let call = 0;
-  const piFetch = async () => {
+  const piFetch = async (url = "") => {
+    // 说话直写是独立链路（/ingest），永远 200，不参与 pi 的失败序列
+    if (String(url).includes("/ingest")) {
+      return { status: 200, text: async () => JSON.stringify({ ok: true }) };
+    }
     call += 1;
     return call === 1
       ? { status: 503, text: async () => JSON.stringify({ error: "disabled" }) }

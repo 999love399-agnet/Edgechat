@@ -62,6 +62,52 @@ export async function fingerprintOf(...parts) {
 }
 
 /**
+ * 对话说话直写 SAG（帮帮 SagMemoryClient.reportSpeak 的 worker 版移植，02:11 授权）。
+ * 与采集事件不同：说话内容走完整抽取（extract 不带 false），进 V2 五维事实管线——
+ * 帮帮版 [{"类型":"语音对话","说话人":"用户/AI","内容":"…"}] 同构，V2 unwrapDoc 直读。
+ * - role: "用户" | "AI"；text 截 500 字（帮帮口径）。
+ * - clientMsgId 幂等键由调用方定（chat 侧用 chat_msg_<messageId>，重结算不重复落库）。
+ * - 失败不抛异常：返回 { ok, status }，调用方记账不阻塞摘要主链路。
+ */
+export async function postSpeakIngest(
+  env,
+  token,
+  { role, text, speakTimeMs, clientMsgId = "", fetchImpl = fetch, timeoutMs = INGEST_TIMEOUT_MAX_MS } = {}
+) {
+  const safeRole = role === "AI" ? "AI" : "用户";
+  const body = {
+    title: `[Chat] ${safeRole}说话`,
+    content: JSON.stringify({
+      类型: "语音对话",
+      说话人: safeRole,
+      内容: String(text || "").slice(0, 500)
+    }),
+    metadata: {
+      source: "chat",
+      input: "text",
+      type: safeRole === "AI" ? "ai_speak" : "user_speak",
+      speak_time_ms: Number(speakTimeMs) || Date.now(),
+      ...(clientMsgId ? { client_msg_id: String(clientMsgId).slice(0, 128) } : {})
+    }
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(ingestUrl(env), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SAG-Token": token },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    return { ok: response.ok, status: response.status };
+  } catch (error) {
+    return { ok: false, status: 0, reason: String(error?.name || error?.message || "network").slice(0, 40) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * 归一化一批事件 + 生成幂等键。
  * 返回 { ok: true, events, batchId, skipped } 或 { ok: false, reason }（reason 直接给端上看的 400 文案）。
  * - content 只收字符串（音频等非文字内容在这一层就被挡掉，本链路不新增任何音频字段）。

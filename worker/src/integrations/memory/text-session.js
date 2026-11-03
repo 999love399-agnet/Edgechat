@@ -8,6 +8,8 @@ import {
   updateTextSessionReportResult
 } from "./accounts.js";
 import { reportSessionEnded } from "./pi-client.js";
+import { postSpeakIngest } from "./ingest-client.js";
+import { decryptMessageContent } from "../../encryption.js";
 
 /**
  * TASK-133：文本会话结算（本单最大坑的落点）。
@@ -22,10 +24,117 @@ import { reportSessionEnded } from "./pi-client.js";
 
 const MAX_ATTEMPTS = 3;
 const RETRY_AGE_MINUTES = 5;
+/** 单段结算最多转发多少条说话消息（防御极端长会话拖垮请求；超出部分下段兜底）。 */
+const MAX_FORWARD_MESSAGES = 50;
 
 /** session_id 语义唯一实现：roomId + 该段最后一条消息 id。 */
 export function sessionIdFor(roomId, lastMessageId) {
   return `chat_dm_${Number(roomId)}_${Number(lastMessageId)}`;
+}
+
+/** D1 的 CURRENT_TIMESTAMP 是 UTC 的 "YYYY-MM-DD HH:MM:SS"，转毫秒；解析不出返回 0。 */
+function dbTimestampMs(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const normalized = text.includes("T") ? text : `${text.replace(" ", "T")}Z`;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * 对话说话直写 SAG（帮帮 reportSpeak 的云端移植，02:11 授权"移植帮帮有而 chat 版没有的能力"）。
+ * 在结算摘要之前，把本段新消息（上一结算点之后 → lastMessageId）逐条转发给 SAG /ingest：
+ * - 帮帮版由 vFlow 壳端上直报（[vFlow] 用户说话/AI说话）；chat 版消息本体就在云端 D1 里，
+ *   worker 直读解密后代报，端上零改动（不新装上报器、不耗手机流量）。
+ * - 格式与帮帮同构：{"类型":"语音对话","说话人":"用户/AI","内容":"…"}，metadata.type=user_speak/ai_speak，
+ *   extract 不带 false → SAG 走完整抽取，进 V2 五维事实管线（说话才是记忆的主料）。
+ * - 幂等：client_msg_id=chat_msg_<messageId>（SAG 幂等闸按它去重，重结算/重试不重复落库）。
+ * - 失败只记日志，不抛异常、不阻塞摘要主链路（pi 摘要兜底仍然按时跑；失败段下轮 cron 重试时
+ *   上一次已成功的消息靠幂等键跳过）。
+ */
+async function forwardSessionMessages(env, { roomId, userId, lastMessageId, fetchImpl = fetch }) {
+  try {
+    const prev = await env.DB.prepare(
+      `SELECT MAX(r.last_message_id) AS prev
+       FROM text_session_reports r
+       WHERE r.room_id = ? AND r.last_message_id < ? AND r.user_id = ? AND r.status = 'reported'`
+    )
+      .bind(Number(roomId), Number(lastMessageId), Number(userId))
+      .first();
+    const afterId = Number(prev?.prev || 0);
+    const rows = await env.DB.prepare(
+      `SELECT m.id, m.content, m.sender_id, m.sender_kind, m.source, m.external_sender_id,
+              m.created_at, u.username AS sender_username
+       FROM messages m LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.channel_id = ? AND m.id > ? AND m.id <= ? AND m.deleted_at IS NULL
+         AND m.sender_kind = 'local' AND m.content IS NOT NULL AND m.content != ''
+       ORDER BY m.id ASC LIMIT ?`
+    )
+      .bind(Number(roomId), afterId, Number(lastMessageId), MAX_FORWARD_MESSAGES)
+      .all();
+    const list = rows.results || [];
+    const bot = await env.DB.prepare(
+      `SELECT id FROM users WHERE username = 'benben' AND deleted_at IS NULL LIMIT 1`
+    ).first();
+    const botId = Number(bot?.id || 0);
+    if (!botId) return { forwarded: 0, skipped: "no_bot" };
+
+    const account = await readMemoryToken(env, Number(userId));
+    if (!account?.token) return { forwarded: 0, skipped: "no_account" };
+
+    let forwarded = 0;
+    let failed = 0;
+    for (const row of list) {
+      const senderId = Number(row.sender_id || 0);
+      // 只转发「用户 ↔ 笨笨」两个声道；桥接/系统消息不进记忆
+      if (senderId !== botId && senderId !== Number(userId)) continue;
+      let text = "";
+      try {
+        text = await decryptMessageContent(env, row.content, {
+          channelId: Number(roomId),
+          senderId,
+          senderContext: ""
+        });
+      } catch {
+        continue; // 解密失败的消息（含音频附件占位）跳过，不阻塞其余转发
+      }
+      if (!String(text || "").trim()) continue;
+      const role = senderId === botId ? "AI" : "用户";
+      const createdMs = dbTimestampMs(row.created_at) || Date.now();
+      const r = await postSpeakIngest(env, account.token, {
+        role,
+        text,
+        speakTimeMs: createdMs,
+        clientMsgId: `chat_msg_${Number(row.id)}`,
+        fetchImpl
+      });
+      if (r.ok) forwarded += 1;
+      else failed += 1;
+    }
+    if (list.length) {
+      console.log(
+        JSON.stringify({
+          message: "text_session speak forwarded",
+          roomId: Number(roomId),
+          afterId,
+          lastMsg: Number(lastMessageId),
+          forwarded,
+          failed
+        })
+      );
+    }
+    return { forwarded, failed };
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        message: "text_session speak forward error",
+        roomId: Number(roomId),
+        lastMsg: Number(lastMessageId),
+        error: String(error?.message || error || "").slice(0, 120)
+      })
+    );
+    return { forwarded: 0, failed: 0, error: true };
+  }
 }
 
 async function attemptReport(
@@ -40,6 +149,8 @@ async function attemptReport(
     return { status: "no_account", piStatus: null };
   }
   const endedAt = Date.now();
+  // 先把本段新消息直写 SAG（帮帮口径：说话内容进 V2 抽取管线），再报摘要
+  await forwardSessionMessages(env, { roomId, userId, lastMessageId, fetchImpl });
   const piStatus = await reportSessionEnded(
     env,
     account.token,
