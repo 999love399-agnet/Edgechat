@@ -72,7 +72,7 @@ export async function fingerprintOf(...parts) {
 export async function postSpeakIngest(
   env,
   token,
-  { role, text, speakTimeMs, clientMsgId = "", fetchImpl = fetch, timeoutMs = INGEST_TIMEOUT_MAX_MS } = {}
+  { role, text, speakTimeMs, clientMsgId = "", ownerUserId = "", fetchImpl = fetch, timeoutMs = INGEST_TIMEOUT_MAX_MS } = {}
 ) {
   const safeRole = role === "AI" ? "AI" : "用户";
   const body = {
@@ -87,7 +87,9 @@ export async function postSpeakIngest(
       input: "text",
       type: safeRole === "AI" ? "ai_speak" : "user_speak",
       speak_time_ms: Number(speakTimeMs) || Date.now(),
-      ...(clientMsgId ? { client_msg_id: String(clientMsgId).slice(0, 128) } : {})
+      ...(clientMsgId ? { client_msg_id: String(clientMsgId).slice(0, 128) } : {}),
+      // owner_user_id：V2 poller 按它路由租户（缺失时文档被跳过不进抽取）——帮帮口径的必带键
+      ...(ownerUserId ? { owner_user_id: String(ownerUserId).slice(0, 64) } : {})
     }
   };
   const controller = new AbortController();

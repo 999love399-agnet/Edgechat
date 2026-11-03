@@ -106,10 +106,21 @@ async function forwardSessionMessages(env, { roomId, userId, lastMessageId, fetc
         text,
         speakTimeMs: createdMs,
         clientMsgId: `chat_msg_${Number(row.id)}`,
+        ownerUserId: account.customerId || "",
         fetchImpl
       });
       if (r.ok) forwarded += 1;
       else failed += 1;
+      if (!r.ok && r.status) {
+        console.log(
+          JSON.stringify({
+            message: "text_session speak forward item failed",
+            roomId: Number(roomId),
+            msgId: Number(row.id),
+            status: r.status
+          })
+        );
+      }
     }
     if (list.length) {
       console.log(
